@@ -4,7 +4,12 @@
 // the stats endpoint does not hit the database on every read.
 package stats
 
-import "sync"
+import (
+	"context"
+	"sync"
+
+	"github.com/convin/webhook-ingest/internal/store"
+)
 
 // AccountStats is a point-in-time view of one account's totals.
 type AccountStats struct {
@@ -44,4 +49,30 @@ func (c *Cache) Record(accountID string, durationSec int) {
 	}
 	s.CallCount++
 	s.TotalDurationSec += int64(durationSec)
+}
+
+// LoadFromDB loads all account stats from the database into the cache.
+// Call this on service startup to hydrate the cache from durable storage.
+func (c *Cache) LoadFromDB(ctx context.Context, st *store.Store) error {
+	rows, err := st.Pool().Query(ctx, `SELECT account_id, call_count, total_duration_sec FROM account_stats`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for rows.Next() {
+		var accountID string
+		var callCount, totalDurationSec int64
+		if err := rows.Scan(&accountID, &callCount, &totalDurationSec); err != nil {
+			return err
+		}
+		c.m[accountID] = &AccountStats{
+			CallCount:        callCount,
+			TotalDurationSec: totalDurationSec,
+		}
+	}
+	return rows.Err()
 }
