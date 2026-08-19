@@ -7,8 +7,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// Querier is the interface implemented by both *pgxpool.Pool and pgx.Tx.
+type Querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // Event is one call-completion webhook delivery.
 type Event struct {
@@ -58,6 +65,25 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
 
+// WithTx runs fn inside a transaction. If fn returns an error, the transaction
+// is rolled back; otherwise it is committed.
+func (s *Store) WithTx(ctx context.Context, fn func(Querier) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	err = fn(tx)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // EventExists reports whether an event with this ID has already been stored.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
@@ -81,9 +107,40 @@ func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	return err
 }
 
+// InsertEventIdempotent stores the raw delivery if the event_id doesn't exist.
+// Returns (true, nil) if inserted, (false, nil) if already existed (duplicate),
+// or (false, err) on other errors.
+func (s *Store) InsertEventIdempotent(ctx context.Context, e Event) (bool, error) {
+	return s.InsertEventIdempotentTx(ctx, s.pool, e)
+}
+
+// InsertEventIdempotentTx is the transaction-aware version.
+func (s *Store) InsertEventIdempotentTx(ctx context.Context, q Querier, e Event) (bool, error) {
+	var inserted bool
+	err := q.QueryRow(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING
+		 RETURNING true`,
+		e.EventID, e.CallID, e.AccountID, e.Payload).Scan(&inserted)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// ON CONFLICT DO NOTHING returns no row when conflict occurs
+			return false, nil
+		}
+		return false, err
+	}
+	return inserted, nil
+}
+
 // UpsertCall creates or refreshes the call record for this event.
 func (s *Store) UpsertCall(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+	return s.UpsertCallTx(ctx, s.pool, e)
+}
+
+// UpsertCallTx is the transaction-aware version.
+func (s *Store) UpsertCallTx(ctx context.Context, q Querier, e Event) error {
+	_, err := q.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
 		 ON CONFLICT (call_id) DO UPDATE SET
@@ -105,7 +162,12 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 
 // IncrementAccountStats folds one completed call into the durable aggregate.
 func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
-	_, err := s.pool.Exec(ctx,
+	return s.IncrementAccountStatsTx(ctx, s.pool, accountID, durationSec)
+}
+
+// IncrementAccountStatsTx is the transaction-aware version.
+func (s *Store) IncrementAccountStatsTx(ctx context.Context, q Querier, accountID string, durationSec int) error {
+	_, err := q.Exec(ctx,
 		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
 		 VALUES ($1, 1, $2)
 		 ON CONFLICT (account_id) DO UPDATE SET

@@ -13,6 +13,9 @@ import (
 	"github.com/convin/webhook-ingest/internal/store"
 )
 
+// Querier is the interface for database operations (both pool and tx).
+type Querier = store.Querier
+
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
@@ -37,15 +40,6 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,21 +55,43 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	// Use a transaction to ensure atomicity across events, calls, and stats.
+	// The idempotent insert ensures duplicate event_ids don't double-count.
+	var inserted bool
+	err = s.store.WithTx(ctx, func(q store.Querier) error {
+		inserted, err = s.store.InsertEventIdempotentTx(ctx, q, rec)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			// Duplicate event - nothing more to do
+			return nil
+		}
+		if err := s.store.UpsertCallTx(ctx, q, rec); err != nil {
+			return err
+		}
+		if err := s.store.IncrementAccountStatsTx(ctx, q, rec.AccountID, rec.DurationSec); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
+	// Cache update happens after successful transaction commit
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
+			if err := s.processRecording(context.Background(), rec); err != nil {
 				// TODO: handle
 			}
 		}()
