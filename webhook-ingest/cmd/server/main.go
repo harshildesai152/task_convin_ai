@@ -64,7 +64,14 @@ func main() {
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	// Stop accepting new HTTP requests
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shutdown", "err", err)
+		log.Error("HTTP server shutdown", "err", err)
 	}
+
+	// Wait for recording worker to finish in-flight work
+	log.Info("waiting for recording worker to drain")
+	svc.Shutdown()
+	log.Info("shutdown complete")
 }

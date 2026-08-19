@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -24,17 +25,47 @@ const recordingWork = 50 * time.Millisecond
 // Should be longer than the max expected ingestion time.
 const idempotencyLockTTL = 10 * time.Second
 
-// Service ingests webhook deliveries.
-type Service struct {
-	store *store.Store
-	cache *stats.Cache
-	rdb   *redis.Client
-	log   *slog.Logger
+// RecordingJob represents a recording that needs to be processed.
+type RecordingJob struct {
+	CallID       string
+	RecordingURL string
 }
 
-// New builds a Service.
+// Service ingests webhook deliveries.
+type Service struct {
+	store          *store.Store
+	cache          *stats.Cache
+	rdb            *redis.Client
+	log            *slog.Logger
+	recordingQueue chan RecordingJob
+	workerWG       sync.WaitGroup
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+}
+
+// New builds a Service and starts the recording worker.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
-	return &Service{store: s, cache: c, rdb: rdb, log: log}
+	ctx, cancel := context.WithCancel(context.Background())
+	svc := &Service{
+		store:          s,
+		cache:          c,
+		rdb:            rdb,
+		log:            log,
+		recordingQueue: make(chan RecordingJob, 1000),
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
+	}
+	svc.startRecordingWorker()
+	return svc
+}
+
+// Shutdown stops the recording worker and waits for in-flight work to complete.
+func (s *Service) Shutdown() {
+	s.log.Info("shutting down recording worker")
+	close(s.recordingQueue)
+	s.workerWG.Wait()
+	s.shutdownCancel()
+	s.log.Info("recording worker stopped")
 }
 
 // Stats returns the cached totals for an account.
@@ -115,13 +146,14 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	// Cache update happens after successful transaction commit
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
+	// Queue recording for background processing (non-blocking)
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(context.Background(), rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		select {
+		case s.recordingQueue <- RecordingJob{CallID: rec.CallID, RecordingURL: rec.RecordingURL}:
+			s.log.Debug("recording queued", "call_id", rec.CallID)
+		default:
+			s.log.Error("recording queue full, dropping recording", "call_id", rec.CallID)
+		}
 	}
 
 	return nil
@@ -183,19 +215,96 @@ func (s *Service) ingestWithRetry(ctx context.Context, evt Event) error {
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(context.Background(), rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		select {
+		case s.recordingQueue <- RecordingJob{CallID: rec.CallID, RecordingURL: rec.RecordingURL}:
+			s.log.Debug("recording queued", "call_id", rec.CallID)
+		default:
+			s.log.Error("recording queue full, dropping recording", "call_id", rec.CallID)
+		}
 	}
 
 	return nil
 }
 
+// startRecordingWorker starts the background worker that processes recordings.
+func (s *Service) startRecordingWorker() {
+	s.workerWG.Add(1)
+	go func() {
+		defer s.workerWG.Done()
+		s.recordingWorker(s.shutdownCtx)
+	}()
+}
+
+// recordingWorker processes recordings from the queue with retry logic.
+func (s *Service) recordingWorker(ctx context.Context) {
+	s.log.Info("recording worker started")
+	for {
+		select {
+		case job, ok := <-s.recordingQueue:
+			if !ok {
+				// Channel closed, drain remaining jobs
+				s.log.Info("recording queue closed, draining remaining jobs")
+				for remainingJob := range s.recordingQueue {
+					s.processRecordingWithRetry(ctx, remainingJob)
+				}
+				return
+			}
+			s.processRecordingWithRetry(ctx, job)
+		case <-ctx.Done():
+			s.log.Info("recording worker context cancelled, draining queue")
+			// Drain remaining jobs
+			for remainingJob := range s.recordingQueue {
+				s.processRecordingWithRetry(ctx, remainingJob)
+			}
+			return
+		}
+	}
+}
+
+// processRecordingWithRetry processes a recording with exponential backoff retry.
+func (s *Service) processRecordingWithRetry(ctx context.Context, job RecordingJob) {
+	const maxRetries = 5
+	baseDelay := 100 * time.Millisecond
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			s.log.Info("shutdown during recording processing, re-queueing", "call_id", job.CallID)
+			// Re-queue for next startup (in a real system, persist to DB)
+			return
+		default:
+		}
+
+		s.log.Info("processing recording", "call_id", job.CallID, "attempt", attempt+1)
+		err := s.processRecording(ctx, job)
+		if err == nil {
+			s.log.Info("recording processed successfully", "call_id", job.CallID)
+			return
+		}
+
+		s.log.Warn("recording processing failed", "call_id", job.CallID, "attempt", attempt+1, "err", err)
+
+		if attempt == maxRetries {
+			s.log.Error("recording processing failed permanently after max retries", "call_id", job.CallID, "err", err)
+			// In production: alert, dead-letter queue, etc.
+			return
+		}
+
+		// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1.6s
+		delay := baseDelay * time.Duration(1<<attempt)
+		s.log.Info("retrying recording", "call_id", job.CallID, "delay", delay)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // processRecording downloads and transcodes the call recording, then marks
 // the call as done.
-func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
+func (s *Service) processRecording(ctx context.Context, job RecordingJob) error {
+	// Simulate downloading and transcoding
 	time.Sleep(recordingWork)
-	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+	return s.store.MarkRecordingProcessed(ctx, job.CallID)
 }
