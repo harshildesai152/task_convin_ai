@@ -39,7 +39,14 @@ func main() {
 	}
 	defer func() { _ = rdb.Close() }()
 
-	svc := ingest.New(st, stats.NewCache(), rdb, log)
+	cache := stats.NewCache()
+	// Hydrate cache from database on startup so stats are accurate after restart
+	if err := cache.LoadFromDB(ctx, st); err != nil {
+		log.Error("hydrate cache from DB", "err", err)
+		os.Exit(1)
+	}
+
+	svc := ingest.New(st, cache, rdb, log)
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewRouter(svc, log)}
 
 	go func() {
